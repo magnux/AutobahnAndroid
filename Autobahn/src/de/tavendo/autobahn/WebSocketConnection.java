@@ -23,8 +23,9 @@ import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.channels.SocketChannel;
+import java.util.List;
+import org.apache.http.message.BasicNameValuePair;
 
-import android.os.AsyncTask;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Message;
@@ -50,6 +51,7 @@ public class WebSocketConnection implements WebSocket {
    private String mWsPath;
    private String mWsQuery;
    private String[] mWsSubprotocols;
+   private List<BasicNameValuePair> mWsHeaders;
 
    private WebSocket.ConnectionHandler mWsHandler;
 
@@ -58,77 +60,73 @@ public class WebSocketConnection implements WebSocket {
    private boolean mActive;
    private boolean mPrevConnected;
 
-   /**
-    * Asynch socket connector.
-    */
-   private class WebSocketConnector extends AsyncTask<Void, Void, String> {
+	/**
+	 * Asynchronous socket connector.
+	 */
+	private class WebSocketConnector extends Thread {
 
-      @Override
-      protected String doInBackground(Void... params) {
+		public void run() {
+			Thread.currentThread().setName("WebSocketConnector");
 
-         Thread.currentThread().setName("WebSocketConnector");
+			/*
+			 * connect TCP socket
+			 */
+			try {
+				mTransportChannel = SocketChannel.open();
 
-         // connect TCP socket
-         // http://developer.android.com/reference/java/nio/channels/SocketChannel.html
-         //
-         try {
-            mTransportChannel = SocketChannel.open();
+				// the following will block until connection was established or
+				// an error occurred!
+				mTransportChannel.socket().connect(
+						new InetSocketAddress(mWsHost, mWsPort),
+						mOptions.getSocketConnectTimeout());
 
-            // the following will block until connection was established or an error occurred!
-            mTransportChannel.socket().connect(new InetSocketAddress(mWsHost, mWsPort), mOptions.getSocketConnectTimeout());
+				// before doing any data transfer on the socket, set socket
+				// options
+				mTransportChannel.socket().setSoTimeout(
+						mOptions.getSocketReceiveTimeout());
+				mTransportChannel.socket().setTcpNoDelay(
+						mOptions.getTcpNoDelay());
 
-            // before doing any data transfer on the socket, set socket options
-            mTransportChannel.socket().setSoTimeout(mOptions.getSocketReceiveTimeout());
-            mTransportChannel.socket().setTcpNoDelay(mOptions.getTcpNoDelay());
+			} catch (IOException e) {
+				onClose(WebSocketConnectionHandler.CLOSE_CANNOT_CONNECT,
+						e.getMessage());
+				return;
+			}
 
-            return null;
+			if (mTransportChannel.isConnected()) {
 
-         } catch (IOException e) {
+				try {
 
-            return e.getMessage();
-         }
-      }
+					// create & start WebSocket reader
+					createReader();
 
-      @Override
-      protected void onPostExecute(String reason) {
+					// create & start WebSocket writer
+					createWriter();
 
-         if (reason != null) {
+					// start WebSockets handshake
+					WebSocketMessage.ClientHandshake hs = new WebSocketMessage.ClientHandshake(
+							mWsHost + ":" + mWsPort);
+					hs.mPath = mWsPath;
+					hs.mQuery = mWsQuery;
+					hs.mSubprotocols = mWsSubprotocols;
+					hs.mHeaderList = mWsHeaders;
+					mWriter.forward(hs);
 
-            onClose(WebSocketConnectionHandler.CLOSE_CANNOT_CONNECT, reason);
+					mPrevConnected = true;
 
-         } else if (mTransportChannel.isConnected()) {
+				} catch (Exception e) {
+					onClose(WebSocketConnectionHandler.CLOSE_INTERNAL_ERROR,
+							e.getMessage());
+					return;
+				}
+			} else {
+				onClose(WebSocketConnectionHandler.CLOSE_CANNOT_CONNECT,
+						"Could not connect to WebSocket server");
+				return;
+			}
+		}
 
-            try {
-
-               // create & start WebSocket reader
-               createReader();
-
-               // create & start WebSocket writer
-               createWriter();
-
-               // start WebSockets handshake
-               WebSocketMessage.ClientHandshake hs = new WebSocketMessage.ClientHandshake(mWsHost + ":" + mWsPort);
-               hs.mPath = mWsPath;
-               hs.mQuery = mWsQuery;
-               hs.mSubprotocols = mWsSubprotocols;
-               mWriter.forward(hs);
-               
-               mPrevConnected = true;
-
-            } catch (Exception e) {
-
-               onClose(WebSocketConnectionHandler.CLOSE_INTERNAL_ERROR, e.getMessage());
-
-            }
-
-         } else {
-
-            onClose(WebSocketConnectionHandler.CLOSE_CANNOT_CONNECT, "could not connect to WebSockets server");
-         }
-      }
-
-   }
-
+	}
 
    public WebSocketConnection() {
       if (DEBUG) Log.d(TAG, "created");
@@ -209,16 +207,16 @@ public class WebSocketConnection implements WebSocket {
 
 
    public void connect(String wsUri, WebSocket.ConnectionHandler wsHandler) throws WebSocketException {
-      connect(wsUri, null, wsHandler, new WebSocketOptions());
+      connect(wsUri, null, wsHandler, new WebSocketOptions(), null);
    }
 
 
    public void connect(String wsUri, WebSocket.ConnectionHandler wsHandler, WebSocketOptions options) throws WebSocketException {
-      connect(wsUri, null, wsHandler, options);
+      connect(wsUri, null, wsHandler, options, null);
    }
 
 
-   public void connect(String wsUri, String[] wsSubprotocols, WebSocket.ConnectionHandler wsHandler, WebSocketOptions options) throws WebSocketException {
+   public void connect(String wsUri, String[] wsSubprotocols, WebSocket.ConnectionHandler wsHandler, WebSocketOptions options, List<BasicNameValuePair> headers) throws WebSocketException {
 
       // don't connect if already connected .. user needs to disconnect first
       //
@@ -275,7 +273,7 @@ public class WebSocketConnection implements WebSocket {
       }
 
       mWsSubprotocols = wsSubprotocols;
-
+      mWsHeaders = headers;
       mWsHandler = wsHandler;
 
       // make copy of options!
@@ -285,7 +283,7 @@ public class WebSocketConnection implements WebSocket {
       mActive = true;
 
       // use asynch connector on short-lived background thread
-      new WebSocketConnector().execute();
+      new WebSocketConnector().start();
    }
 
 
@@ -305,7 +303,7 @@ public class WebSocketConnection implements WebSocket {
     */
    public boolean reconnect() {
 	   if (!isConnected() && (mWsUri != null)) {
-		   new WebSocketConnector().execute();
+		   new WebSocketConnector().start();
 		   return true;
 	   }
 	   return false;
